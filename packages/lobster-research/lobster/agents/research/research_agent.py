@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional, Union
 
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
+from langgraph.errors import GraphInterrupt
 
 from lobster.agents.research.config import (
     ESSENTIAL_FIELDS,
@@ -188,9 +189,70 @@ def research_agent(
                 QueuePreparationService,
             )
 
+            logger.info(
+                "[GEO preference] initializing research queue preparation service"
+            )
             _queue_preparation_service = QueuePreparationService(data_manager)
+            geo_preparer = _queue_preparation_service.get_preparer_for_database("geo")
+            if geo_preparer is not None:
+                geo_preparer.source_selector = select_geo_source
+            logger.info(
+                "[GEO preference] research queue service ready geo_preparer=%s",
+                type(geo_preparer).__name__,
+            )
             logger.debug("Lazy-loaded QueuePreparationService")
         return _queue_preparation_service
+
+    def select_geo_source(accession):
+        logger.info(
+            "[GEO preference] research selector entered accession=%s interactive=%s",
+            accession,
+            getattr(data_manager, "_interactive", True),
+        )
+        if not getattr(data_manager, "_interactive", True):
+            logger.info(
+                "[GEO preference] question skipped in non-interactive mode accession=%s",
+                accession,
+            )
+            return None
+        from lobster.tools.geo_source_preference import ask_geo_source_preference
+
+        return ask_geo_source_preference(accession)
+
+    def refresh_geo_preference(entry):
+        """Handle legacy/reused entries through the same source selection policy."""
+        logger.info(
+            "[GEO preference] checking reused entry entry_id=%s database=%s available=%s answered=%s",
+            entry.entry_id,
+            entry.database,
+            entry.has_ncbi_rnaseq_counts,
+            entry.source_preference_answered,
+        )
+        if entry.database.lower() != "geo" or entry.source_preference_answered:
+            return entry
+        available = entry.has_ncbi_rnaseq_counts
+        source = entry.selected_source or "author"
+        answered = False
+        if available is None:
+            preparer = get_queue_preparation_service().get_preparer_for_database("geo")
+            fields = preparer.prepare_source(entry.dataset_id)
+            available = fields["has_ncbi_rnaseq_counts"]
+            source = fields["selected_source"]
+            answered = fields["source_preference_answered"]
+        elif available:
+            preference = select_geo_source(entry.dataset_id)
+            if preference is not None:
+                source, answered = preference, True
+        logger.info(
+            "[GEO preference] saving reused entry preference entry_id=%s available=%s source=%s answered=%s",
+            entry.entry_id,
+            available,
+            source,
+            answered,
+        )
+        return data_manager.download_queue.update_geo_preference(
+            entry.entry_id, available, source, answered
+        )
 
     _uniprot_service = None
     _ensembl_service = None
@@ -1119,7 +1181,8 @@ def research_agent(
                     if entry.dataset_id == identifier
                 ]
 
-                has_ncbi_rnaseq_counts = False
+                if add_to_queue:
+                    queue_entries = [refresh_geo_preference(e) for e in queue_entries]
 
                 # Add to queue if requested and not already present
                 if add_to_queue and not queue_entries:
@@ -1130,20 +1193,33 @@ def research_agent(
 
                         service = get_queue_preparation_service()
                         result = service.prepare(identifier)
+                        logger.info(
+                            "[GEO preference] saving queue entry entry_id=%s",
+                            result.queue_entry.entry_id,
+                        )
                         data_manager.download_queue.add_entry(result.queue_entry)
+                        logger.info(
+                            "[GEO preference] queue entry saved entry_id=%s",
+                            result.queue_entry.entry_id,
+                        )
 
                         logger.info(
                             f"Successfully added cached dataset {identifier} to download queue "
                             f"with entry_id: {result.queue_entry.entry_id}"
                         )
 
-                        has_ncbi_rnaseq_counts = result.has_ncbi_rnaseq_counts
-
                         # Update queue_entries list for response building
                         queue_entries = [result.queue_entry]
 
+                    except GraphInterrupt:
+                        logger.info(
+                            "[GEO preference] research preparation paused; propagating interrupt"
+                        )
+
+                        raise
+
                     except Exception as e:
-                        logger.error(
+                        logger.exception(
                             f"Failed to add cached dataset {identifier} to download queue: {e}"
                         )
                         # Continue with response - queue addition is optional
@@ -1162,12 +1238,6 @@ def research_agent(
                     f"**Database**: {metadata.get('database', 'GEO')}",
                     "",
                 ]
-
-                if has_ncbi_rnaseq_counts:
-                    response_parts.append(
-                        "has_ncbi_rnaseq_counts=True: "
-                        "An NCBI-generated raw count source is also available."
-                    )
 
                 # Add queue status if exists
                 if queue_entries:
@@ -1281,7 +1351,17 @@ def research_agent(
                                 )
                                 queue_entry.validation_status = validation_status
 
+                                logger.info(
+                                    "[GEO preference] saving queue entry entry_id=%s",
+                                    queue_entry.entry_id,
+                                )
+
                                 data_manager.download_queue.add_entry(queue_entry)
+
+                                logger.info(
+                                    "[GEO preference] queue entry saved entry_id=%s",
+                                    queue_entry.entry_id,
+                                )
 
                                 entry_id = queue_entry.entry_id
                                 recommended_strategy = queue_entry.recommended_strategy
@@ -1301,12 +1381,6 @@ def research_agent(
                                 if result.url_data:
                                     report += f"- **Files found**: {result.url_data.file_count}\n"
 
-                                if result.has_ncbi_rnaseq_counts:
-                                    report += (
-                                        "has_ncbi_rnaseq_counts=True: "
-                                        "An NCBI-generated raw count source is also available.\n"
-                                    )
-
                                 # Add warnings if validation status has warnings
                                 if (
                                     validation_status
@@ -1324,8 +1398,15 @@ def research_agent(
                                 report += "1. Supervisor can query queue: `get_content_from_workspace(workspace='download_queue')`\n"
                                 report += f"2. Hand off to data_expert with entry_id: `{entry_id}`\n"
 
+                            except GraphInterrupt:
+                                logger.info(
+                                    "[GEO preference] research preparation paused; propagating interrupt"
+                                )
+
+                                raise
+
                             except Exception as e:
-                                logger.error(
+                                logger.exception(
                                     f"Failed to add {identifier} to download queue: {e}"
                                 )
                                 # Return validation result even if queue addition fails
@@ -1350,12 +1431,26 @@ def research_agent(
                         f"For '{identifier}', use `prepare_dataset_download(accession='{identifier}')` instead."
                     )
 
+            except GraphInterrupt:
+                logger.info(
+                    "[GEO preference] research preparation paused; propagating interrupt"
+                )
+
+                raise
+
             except Exception as e:
-                logger.error(f"Error accessing dataset {identifier}: {e}")
+                logger.exception(f"Error accessing dataset {identifier}: {e}")
                 return f"Error accessing dataset {identifier}: {str(e)}"
 
+        except GraphInterrupt:
+            logger.info(
+                "[GEO preference] research preparation paused; propagating interrupt"
+            )
+
+            raise
+
         except Exception as e:
-            logger.error(f"Error in metadata validation: {e}")
+            logger.exception(f"Error in metadata validation: {e}")
             return f"Error validating dataset metadata: {str(e)}"
 
     validate_dataset_metadata.metadata = {"categories": ["QUALITY"], "provenance": True}
@@ -1402,7 +1497,7 @@ def research_agent(
                 if entry.dataset_id == accession
             ]
             if existing:
-                entry = existing[0]
+                entry = refresh_geo_preference(existing[0])
                 return (
                     f"Dataset '{accession}' is already in the download queue.\n"
                     f"- **Entry ID**: `{entry.entry_id}`\n"
@@ -1424,7 +1519,15 @@ def research_agent(
             result = service.prepare(accession, database=database, priority=priority)
 
             # Add to download queue
+            logger.info(
+                "[GEO preference] saving queue entry entry_id=%s",
+                result.queue_entry.entry_id,
+            )
             data_manager.download_queue.add_entry(result.queue_entry)
+            logger.info(
+                "[GEO preference] queue entry saved entry_id=%s",
+                result.queue_entry.entry_id,
+            )
 
             entry = result.queue_entry
             strategy = entry.recommended_strategy
@@ -1437,12 +1540,6 @@ def research_agent(
                 f"**Entry ID**: `{entry.entry_id}`",
                 f"**Status**: {entry.status}",
             ]
-
-            if result.has_ncbi_rnaseq_counts:
-                report_parts.append(
-                    "has_ncbi_rnaseq_counts=True: "
-                    "An NCBI-generated raw count source is also available."
-                )
 
             if strategy:
                 report_parts.extend(
@@ -1478,8 +1575,15 @@ def research_agent(
             )
             return "\n".join(report_parts)
 
+        except GraphInterrupt:
+            logger.info(
+                "[GEO preference] research preparation paused; propagating interrupt"
+            )
+
+            raise
+
         except Exception as e:
-            logger.error(f"Failed to prepare download for {accession}: {e}")
+            logger.exception(f"Failed to prepare download for {accession}: {e}")
             return f"Error preparing download for '{accession}': {str(e)}"
 
     prepare_dataset_download.metadata = {"categories": ["UTILITY"], "provenance": False}

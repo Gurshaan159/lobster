@@ -159,36 +159,22 @@ class TestGDSCanonToGSE:
 
 
 @pytest.mark.parametrize("available", [True, False, RuntimeError("NCBI unavailable")])
-def test_ncbi_availability_does_not_change_queue(preparer, available, caplog):
-    from lobster.core.interfaces.queue_preparer import QueuePreparationResult
-    from lobster.core.schemas.download_queue import DownloadQueueEntry
-
-    entry = DownloadQueueEntry(
-        entry_id="test",
-        dataset_id="GSE123",
-        database="geo",
-        matrix_url="https://example.org/author.txt",
-        metadata={"title": "Author data"},
-    )
-    before = entry.model_dump()
-    prepared = QueuePreparationResult(queue_entry=entry)
+def test_ncbi_availability_source_fields(preparer, available, caplog):
     check = preparer._geo_provider.has_ncbi_rnaseq_counts
     if isinstance(available, Exception):
         check.side_effect = available
     else:
         check.return_value = available
-    with patch(
-        "lobster.core.interfaces.queue_preparer.IQueuePreparer.prepare_queue_entry",
-        return_value=prepared,
-    ) as normal_prepare:
-        result = preparer.prepare_queue_entry("GSE123")
-    normal_prepare.assert_called_once_with("GSE123", 5)
+    selector = MagicMock(return_value="ncbi")
+    preparer.source_selector = selector
+    fields = preparer.prepare_source("GSE123")
     check.assert_called_once_with("GSE123")
-    assert result is prepared
-    assert result.has_ncbi_rnaseq_counts is (available is True)
-    assert entry.model_dump() == before
-    if isinstance(available, Exception):
-        assert "Could not check NCBI RNA-seq counts" in caplog.text
+    assert fields["has_ncbi_rnaseq_counts"] == (
+        None if isinstance(available, Exception) else available
+    )
+    assert fields["selected_source"] == ("ncbi" if available is True else "author")
+    assert fields["source_preference_answered"] is (available is True)
+    assert selector.call_count == int(available is True)
 
 
 def test_ncbi_availability_uses_canonical_gse(preparer):
@@ -196,15 +182,12 @@ def test_ncbi_availability_uses_canonical_gse(preparer):
         patch.object(preparer, "_resolve_gds_to_gse", return_value="GSE123"),
         patch(
             "lobster.core.interfaces.queue_preparer.IQueuePreparer.prepare_queue_entry"
-        ),
+        ) as base,
     ):
         preparer.prepare_queue_entry("GDS123")
-    preparer._geo_provider.has_ncbi_rnaseq_counts.assert_called_once_with("GSE123")
+    base.assert_called_once_with("GSE123", 5)
 
 
 def test_ncbi_availability_skipped_for_non_gse(preparer):
-    with patch(
-        "lobster.core.interfaces.queue_preparer.IQueuePreparer.prepare_queue_entry"
-    ):
-        preparer.prepare_queue_entry("GPL570")
+    preparer.prepare_source("GPL570")
     preparer._geo_provider.has_ncbi_rnaseq_counts.assert_not_called()

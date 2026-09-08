@@ -30,10 +30,13 @@ Usage Example:
 from __future__ import annotations
 
 import uuid
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from lobster.core.data_manager_v2 import DataManagerV2
@@ -56,14 +59,12 @@ class QueuePreparationResult:
         url_data: DownloadUrlResult from the provider (for inspection/logging)
         metadata: Raw metadata dict from the database
         validation_summary: Human-readable summary of preparation
-        has_ncbi_rnaseq_counts: Informational availability flag, not persisted in queue
     """
 
     queue_entry: "DownloadQueueEntry"
     url_data: Optional["DownloadUrlResult"] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     validation_summary: str = ""
-    has_ncbi_rnaseq_counts: bool = False
 
 
 class IQueuePreparer(ABC):
@@ -157,6 +158,10 @@ class IQueuePreparer(ABC):
         """
         ...
 
+    def prepare_source(self, accession: str) -> Dict[str, Any]:
+        """Optional source metadata collected before constructing an entry."""
+        return {}
+
     def prepare_queue_entry(
         self, accession: str, priority: int = 5
     ) -> QueuePreparationResult:
@@ -181,11 +186,31 @@ class IQueuePreparer(ABC):
         # Step 1: Fetch metadata
         metadata, validation_info = self.fetch_metadata(accession)
 
+        logger.info(
+            "[GEO preference] metadata fetched; preparing source accession=%s preparer=%s",
+            accession,
+            type(self).__name__,
+        )
+        source_fields = self.prepare_source(accession)
+        logger.info(
+            "[GEO preference] source prepared; extracting URLs accession=%s", accession
+        )
+
         # Step 2: Extract download URLs
         url_data = self.extract_download_urls(accession)
 
+        logger.info(
+            "[GEO preference] URLs extracted; recommending strategy accession=%s",
+            accession,
+        )
+
         # Step 3: Recommend strategy
         recommended_strategy = self.recommend_strategy(metadata, url_data, accession)
+
+        logger.info(
+            "[GEO preference] strategy ready; constructing queue entry accession=%s",
+            accession,
+        )
 
         # Step 4: Assemble queue entry
         database = self.supported_databases()[0]
@@ -195,6 +220,7 @@ class IQueuePreparer(ABC):
         queue_fields = url_data.to_queue_entry_fields()
 
         queue_entry = DownloadQueueEntry(
+            **source_fields,
             entry_id=entry_id,
             dataset_id=accession,
             database=database,
@@ -209,6 +235,12 @@ class IQueuePreparer(ABC):
             h5_url=queue_fields.get("h5_url"),
             created_at=datetime.now(),
             updated_at=datetime.now(),
+        )
+
+        logger.info(
+            "[GEO preference] queue entry constructed accession=%s entry_id=%s",
+            accession,
+            entry_id,
         )
 
         # Build summary

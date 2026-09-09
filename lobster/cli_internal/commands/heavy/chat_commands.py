@@ -22,6 +22,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
+from lobster.cli_internal.classic_interaction import handle_interrupt_classic
 from lobster.cli_internal.commands.heavy.animations import (
     display_goodbye,
     display_welcome,
@@ -704,6 +705,15 @@ def _show_workspace_prompt(client):
         console.print()
 
 
+def _query_classic(client, user_input: str) -> Dict[str, Any]:
+    """Run a query and resume after any supervisor questions."""
+    result = client.query(user_input, stream=False)
+    while result.get("interrupts"):
+        response = handle_interrupt_classic(result["interrupts"][0]["data"])
+        result = next(client.resume_from_interrupt(response, stream=False))
+    return result
+
+
 def _display_streaming_response(
     client,
     user_input: str,
@@ -727,48 +737,66 @@ def _display_streaming_response(
         with Live(
             initial_status, console=console, refresh_per_second=10, transient=True
         ) as live:
-            for event in client.query(user_input, stream=True):
-                event_type = event.get("type")
+            stream_source = client.query(user_input, stream=True)
+            while True:
+                interrupt_event = None
+                for event in stream_source:
+                    event_type = event.get("type")
 
-                if event_type == "content_delta":
-                    accumulated_text += event.get("delta", "")
-                    # Build display with agent indicator + text
-                    display = Text()
-                    if last_agent:
-                        agent_display = last_agent.replace("_", " ").title()
-                        display.append(f"◀ {agent_display}\n", style="dim")
-                    display.append(accumulated_text)
-                    live.update(display)
+                    if event_type == "interrupt":
+                        interrupt_event = event
+                        break
 
-                elif event_type == "agent_change":
-                    agent = event.get("agent", "")
-                    if event.get("status") == "working":
-                        last_agent = agent
-                        # Update status indicator before first content arrives
-                        if not accumulated_text:
-                            agent_display = agent.replace("_", " ").title()
-                            status = Text()
-                            status.append(f"◀ {agent_display}", style="dim")
-                            status.append("  Working…", style="dim italic")
-                            live.update(status)
+                    elif event_type == "content_delta":
+                        accumulated_text += event.get("delta", "")
+                        # Build display with agent indicator + text
+                        display = Text()
+                        if last_agent:
+                            agent_display = last_agent.replace("_", " ").title()
+                            display.append(f"◀ {agent_display}\n", style="dim")
+                        display.append(accumulated_text)
+                        live.update(display)
 
-                elif event_type == "complete":
-                    # Use accumulated text, or fallback to response from event
-                    response_text = accumulated_text or event.get("response", "")
-                    final_result = {
-                        "success": True,
-                        "response": response_text,
-                        "last_agent": event.get("last_agent"),
-                        "token_usage": event.get("token_usage"),
-                        "plots": [],  # Plots handled separately
-                    }
+                    elif event_type == "agent_change":
+                        agent = event.get("agent", "")
+                        if event.get("status") == "working":
+                            last_agent = agent
+                            # Update status indicator before first content arrives
+                            if not accumulated_text:
+                                agent_display = agent.replace("_", " ").title()
+                                status = Text()
+                                status.append(f"◀ {agent_display}", style="dim")
+                                status.append("  Working…", style="dim italic")
+                                live.update(status)
 
-                elif event_type == "error":
-                    final_result = {
-                        "success": False,
-                        "error": event.get("error", "Unknown error"),
-                    }
+                    elif event_type == "complete":
+                        # Use accumulated text, or fallback to response from event
+                        response_text = accumulated_text or event.get("response", "")
+                        final_result = {
+                            "success": True,
+                            "response": response_text,
+                            "last_agent": event.get("last_agent"),
+                            "token_usage": event.get("token_usage"),
+                            "plots": [],  # Plots handled separately
+                        }
+
+                    elif event_type == "error":
+                        final_result = {
+                            "success": False,
+                            "error": event.get("error", "Unknown error"),
+                        }
+                        break
+
+                if interrupt_event is None:
                     break
+
+                live.stop()
+                response = handle_interrupt_classic(interrupt_event["data"])
+                accumulated_text = ""
+                last_agent = None
+                live.update(initial_status)
+                live.start()
+                stream_source = client.resume_from_interrupt(response, stream=True)
 
         return final_result
 
@@ -1051,7 +1079,7 @@ def chat_impl(
                 if should_show_progress(client):
                     console.print("[dim]...[/dim]", end="", flush=True)
 
-                result = client.query(user_input, stream=False)
+                result = _query_classic(client, user_input)
 
                 if should_show_progress(client):
                     console.print("\r   \r", end="", flush=True)

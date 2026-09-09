@@ -326,6 +326,19 @@ class AgentClient(BaseClient):
                         "session_id": self.session_id,
                     }
 
+                if event.get("__interrupt__"):
+                    return {
+                        "success": False,
+                        "interrupts": [
+                            {
+                                "data": getattr(intr, "value", intr),
+                                "interrupt_id": getattr(intr, "id", None),
+                            }
+                            for intr in event["__interrupt__"]
+                        ],
+                        "session_id": self.session_id,
+                    }
+
                 # Track which agent is responding
                 if event:
                     for node_name in event.keys():

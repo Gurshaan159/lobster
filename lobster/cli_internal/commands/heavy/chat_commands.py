@@ -705,11 +705,21 @@ def _show_workspace_prompt(client):
         console.print()
 
 
-def _query_classic(client, user_input: str) -> Dict[str, Any]:
+def _collect_classic_answers(interrupts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Address each answer to its LangGraph interrupt, including parallel pauses."""
+    if any(not event.get("interrupt_id") for event in interrupts):
+        raise ValueError("Cannot resume a question without its interrupt ID")
+    return {
+        event["interrupt_id"]: handle_interrupt_classic(event.get("data"))
+        for event in interrupts
+    }
+
+
+def _query_classic(client, user_input: str) -> dict[str, Any]:
     """Run a query and resume after any supervisor questions."""
     result = client.query(user_input, stream=False)
     while result.get("interrupts"):
-        response = handle_interrupt_classic(result["interrupts"][0]["data"])
+        response = _collect_classic_answers(result["interrupts"])
         result = next(client.resume_from_interrupt(response, stream=False))
     return result
 
@@ -739,13 +749,12 @@ def _display_streaming_response(
         ) as live:
             stream_source = client.query(user_input, stream=True)
             while True:
-                interrupt_event = None
+                interrupts = []
                 for event in stream_source:
                     event_type = event.get("type")
 
                     if event_type == "interrupt":
-                        interrupt_event = event
-                        break
+                        interrupts.append(event)
 
                     elif event_type == "content_delta":
                         accumulated_text += event.get("delta", "")
@@ -787,11 +796,13 @@ def _display_streaming_response(
                         }
                         break
 
-                if interrupt_event is None:
+                if not interrupts:
                     break
 
                 live.stop()
-                response = handle_interrupt_classic(interrupt_event["data"])
+                if accumulated_text:
+                    console.print(Markdown(accumulated_text))
+                response = _collect_classic_answers(interrupts)
                 accumulated_text = ""
                 last_agent = None
                 live.update(initial_status)

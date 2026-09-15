@@ -89,8 +89,33 @@ jobs:
       run: |
         python -m pytest \
           tests/unit/core/test_client.py \
+          tests/unit/core/test_client_interrupt.py \
           tests/unit/core/test_schemas.py \
           tests/unit/core/test_data_manager_v2.py \
+          -m "not slow and not real_api" \
+          --import-mode=importlib \
+          --maxfail=10 \
+          --durations=10 \
+          -v
+
+    - name: Run unit/cli tests (classic chat + HITL interrupt path)
+      run: |
+        # Select by DIRECTORY, not by per-file allowlist: a hardcoded file list
+        # silently skips every test file a contributor adds, so the check goes
+        # green without ever running the new coverage.
+        # Each exclusion below is deliberate — do not drop one without checking:
+        #   test_go_tui_launcher_completions.py — needs the CI-built Go binary,
+        #     so it runs in the go-tui-verify job instead of here.
+        #   test_vector_search_commands.py — stale test: it patches the deprecated
+        #     lobster.services.vector.service shim, but vector_search_commands.py
+        #     imports lobster.vector.service, so the patch never takes effect.
+        #   TestTTYGuard::test_non_tty_stdin_exits_with_error — passes alone, fails
+        #     only after tests/unit/cli/test_command_cmd_impl.py has run in the same
+        #     process (leaked global console breaks its capsys assertion).
+        python -m pytest tests/unit/cli \
+          --ignore=tests/unit/cli/test_go_tui_launcher_completions.py \
+          --ignore=tests/unit/cli/test_vector_search_commands.py \
+          --deselect "tests/unit/cli/test_init_venv_safety.py::TestTTYGuard::test_non_tty_stdin_exits_with_error" \
           -m "not slow and not real_api" \
           --import-mode=importlib \
           --maxfail=10 \
@@ -182,13 +207,15 @@ jobs:
         "
         rm packages/lobster-ai-tui/lobster_ai_tui/bin/lobster-tui
 
-        # Run Go TUI launcher unit tests against built binary
+        # Run Go TUI launcher unit tests against built binary.
+        # Do NOT append '|| true' here — a step that cannot fail is not a test,
+        # and this step is the only CI coverage of the Python->Go bridge.
         python -m pytest \
           tests/unit/cli/test_go_tui_launcher_completions.py \
           -m "not slow and not real_api" \
           --import-mode=importlib \
           --maxfail=3 \
-          -v || true
+          -v
 
   # =====================================================================
   # Build Verification

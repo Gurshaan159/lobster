@@ -41,7 +41,9 @@ jobs:
 
     - name: Run linting
       run: |
-        pip install ruff
+        # Pinned: an unpinned install let ruff 0.16.0's widened default rule set land
+        # mid-flight and fail this step for seven weeks. Bump deliberately, not by drift.
+        pip install ruff==0.16.7
         ruff check lobster/
 
     - name: Check for deprecated data_manager_v2 imports
@@ -270,3 +272,25 @@ jobs:
         echo "- Build Test: ${{ needs.build-test.result }}" >> $GITHUB_STEP_SUMMARY
         echo "- Go TUI Verify: ${{ needs.go-tui-verify.result }}" >> $GITHUB_STEP_SUMMARY
         echo "- Integration Tests: run in Testing Infrastructure (test-packages.yml)" >> $GITHUB_STEP_SUMMARY
+
+    # Generate summary only echoes results, so this job used to report success on every
+    # failing run. A check that structurally cannot fail green-lights everything the
+    # moment someone makes it a required status check. Same pattern as ci-testing.yml.
+    - name: Check job results
+      run: |
+        QUALITY_RESULT="${{ needs.quality-and-tests.result }}"
+        BUILD_RESULT="${{ needs.build-test.result }}"
+        GO_TUI_RESULT="${{ needs.go-tui-verify.result }}"
+
+        echo "Code Quality & Tests: $QUALITY_RESULT"
+        echo "Build Verification:   $BUILD_RESULT"
+        echo "Go TUI Verify:        $GO_TUI_RESULT"
+
+        if [ "$QUALITY_RESULT" = "failure" ] || [ "$BUILD_RESULT" = "failure" ] || [ "$GO_TUI_RESULT" = "failure" ]; then
+          echo ""
+          echo "One or more CI jobs failed. See individual job logs for details."
+          exit 1
+        fi
+
+        echo ""
+        echo "All CI jobs completed successfully!"

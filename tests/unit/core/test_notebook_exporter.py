@@ -4,8 +4,10 @@ Unit tests for NotebookExporter.
 Tests notebook generation from provenance records.
 """
 
+import ast
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import anndata
@@ -17,7 +19,11 @@ import pytest
 from lobster.core.data_manager_v2 import DataManagerV2
 from lobster.core.notebook_exporter import NotebookExporter
 from lobster.core.provenance import ProvenanceTracker
-from lobster.core.provenance.analysis_ir import AnalysisStep, ParameterSpec
+from lobster.core.provenance.analysis_ir import (
+    AnalysisStep,
+    ParameterSpec,
+    create_data_saving_ir,
+)
 
 
 def create_sample_ir(operation: str, tool_name: str, description: str) -> AnalysisStep:
@@ -857,3 +863,136 @@ class TestNotebookExporter:
         # Only the exportable IR should remain
         assert len(pairs) == 1
         assert pairs[0][1].operation == "scanpy.pp.normalize_total"
+
+
+@pytest.fixture
+def ledger_exporter(tmp_path):
+    """Export synthetic activities without a dataset or real tool invocation."""
+    tracker = ProvenanceTracker(namespace="export-characterization")
+    data_manager = SimpleNamespace(workspace_path=tmp_path, modalities={})
+    return NotebookExporter(tracker, data_manager)
+
+
+@pytest.fixture
+def notebook_with_only_save_ir(ledger_exporter):
+    # Use the same IR factory as DataManagerV2.save_modality, without saving data.
+    ledger_exporter.provenance.activities = [
+        {"id": "analysis", "type": "unrecorded_analysis", "ir": None},
+        {
+            "id": "save",
+            "type": "save_dataset",
+            "ir": create_data_saving_ir().to_dict(),
+        },
+    ]
+    path = ledger_exporter.export(name="save_only_ir")
+    return nbformat.read(path, as_version=4)
+
+
+class TestNotebookExportCharacterization:
+    """Characterize export behavior; W1 must invert the two wording tests."""
+
+    def test_save_ir_alone_bypasses_zero_ir_guard(self, notebook_with_only_save_ir):
+        notebook = notebook_with_only_save_ir
+
+        assert notebook.metadata.lobster.ir_statistics == {
+            "n_irs_extracted": 1,
+            "n_activities": 2,
+            "coverage_percent": 50.0,
+        }
+        assert any(
+            "adata.write_h5ad" in cell.source
+            for cell in notebook.cells
+            if cell.cell_type == "code"
+        )
+        # Export succeeds even though there is no analysis step in the notebook.
+        assert not any(cell.source.startswith("## Step ") for cell in notebook.cells)
+
+    @pytest.mark.parametrize("activity_type", ["load_dataset", "save_dataset"])
+    @pytest.mark.parametrize("serialized", [False, True], ids=["object", "dict"])
+    def test_dedicated_io_renders_non_exportable_ir(
+        self, ledger_exporter, activity_type, serialized
+    ):
+        hidden_ir = create_sample_ir("ledger.hidden_io", activity_type, "Hidden IO")
+        hidden_ir.exportable = False
+        hidden_ir.code_template = f'io_bypass_marker = "{activity_type}"'
+        visible_ir = create_sample_ir(
+            "ledger.visible_analysis", "visible_analysis", "Positive control"
+        )
+        ledger_exporter.provenance.activities = [
+            {
+                "id": "hidden-io",
+                "type": activity_type,
+                "ir": hidden_ir.to_dict() if serialized else hidden_ir,
+            },
+            {
+                "id": "visible-analysis",
+                "type": "visible_analysis",
+                "ir": visible_ir.to_dict(),
+            },
+        ]
+
+        path = ledger_exporter.export(name="non_exportable_io")
+        notebook = nbformat.read(path, as_version=4)
+        code = [cell.source for cell in notebook.cells if cell.cell_type == "code"]
+
+        # Only the analysis qualifies, but the dedicated IO cell still renders.
+        assert notebook.metadata.lobster.ir_statistics["n_irs_extracted"] == 1
+        assert notebook.metadata.lobster.ir_statistics["n_activities"] == 2
+        assert code.count(visible_ir.render()) == 1
+        assert code.count(hidden_ir.render()) == 1
+
+    def test_comment_only_ir_exports_a_valid_cell_without_executable_statements(
+        self, ledger_exporter
+    ):
+        ir = AnalysisStep(
+            operation="ledger.suggest_de_formula",
+            tool_name="suggest_de_formula",
+            description="A suggested formula represented only by comments",
+            library="python",
+            code_template=(
+                "# Formula: {{ formula }}\n"
+                "# Main variable: {{ groupby }}\n"
+                "# Covariates: {{ covariates }}"
+            ),
+            imports=[],
+            parameters={
+                "formula": "~ condition",
+                "groupby": "condition",
+                "covariates": [],
+            },
+            parameter_schema={},
+        )
+        ledger_exporter.provenance.activities = [
+            {"id": "comment-only", "type": "suggest_de_formula", "ir": ir.to_dict()}
+        ]
+
+        path = ledger_exporter.export(name="comment_only_ir", validate_syntax=True)
+        notebook = nbformat.read(path, as_version=4)
+        matching_cells = [
+            cell
+            for cell in notebook.cells
+            if cell.cell_type == "code" and cell.source == ir.render()
+        ]
+
+        assert ir.exportable and ir.validates_on_export
+        assert notebook.metadata.lobster.ir_statistics["n_irs_extracted"] == 1
+        assert len(matching_cells) == 1
+        assert ast.parse(matching_cells[0].source).body == []
+
+    def test_current_footer_claims_completeness_despite_partial_coverage(
+        self, notebook_with_only_save_ir
+    ):
+        """W1 will invert this assertion; it documents misleading current text."""
+        notebook = notebook_with_only_save_ir
+
+        assert "**IR Coverage:** 1/2 activities (50.0%)" in notebook.cells[0].source
+        assert "This analysis is now complete." in notebook.cells[-1].source
+
+    def test_current_summary_calls_missing_analysis_an_orchestration_activity(
+        self, notebook_with_only_save_ir
+    ):
+        """W1 will invert this assertion and name the omitted activity."""
+        summary = notebook_with_only_save_ir.cells[-2].source
+
+        assert "**1 orchestration activities**" in summary
+        assert "unrecorded_analysis" not in summary

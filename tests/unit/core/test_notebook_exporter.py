@@ -227,7 +227,9 @@ class TestNotebookExporter:
         """Test provenance summary cell creation."""
         exporter = NotebookExporter(provenance_tracker, data_manager)
         cell = exporter._create_provenance_summary_cell(
-            total_activities=100, exportable_count=5
+            total_activities=100,
+            exportable_count=5,
+            excluded_activity_types=["unrecorded_analysis"] * 95,
         )
 
         assert cell.cell_type == "markdown"
@@ -889,7 +891,7 @@ def notebook_with_only_save_ir(ledger_exporter):
 
 
 class TestNotebookExportCharacterization:
-    """Characterize export behavior; W1 must invert the two wording tests."""
+    """Characterize export behavior and the limits reported in notebook text."""
 
     def test_save_ir_alone_bypasses_zero_ir_guard(self, notebook_with_only_save_ir):
         notebook = notebook_with_only_save_ir
@@ -979,20 +981,97 @@ class TestNotebookExportCharacterization:
         assert len(matching_cells) == 1
         assert ast.parse(matching_cells[0].source).body == []
 
-    def test_current_footer_claims_completeness_despite_partial_coverage(
+    def test_footer_reports_excluded_activities_without_claiming_completeness(
         self, notebook_with_only_save_ir
     ):
-        """W1 will invert this assertion; it documents misleading current text."""
         notebook = notebook_with_only_save_ir
+        headers = [
+            cell
+            for cell in notebook.cells
+            if cell.cell_type == "markdown" and "**IR Coverage:**" in cell.source
+        ]
+        footers = [
+            cell
+            for cell in notebook.cells
+            if cell.cell_type == "markdown" and "## Results Export" in cell.source
+        ]
 
-        assert "**IR Coverage:** 1/2 activities (50.0%)" in notebook.cells[0].source
-        assert "This analysis is now complete." in notebook.cells[-1].source
+        assert len(headers) == len(footers) == 1
+        assert "**IR Coverage:** 1/2 activities (50.0%)" in headers[0].source
+        assert "This analysis is now complete." not in footers[0].source
+        assert "Notebook export is complete." not in footers[0].source
+        assert "unrecorded_analysis" in footers[0].source
+        assert "⚠ No IR" not in footers[0].source
+        assert "IR-enabled steps are fully reproducible." not in footers[0].source
+        assert (
+            "IR coverage alone does not establish reproducibility." in footers[0].source
+        )
 
-    def test_current_summary_calls_missing_analysis_an_orchestration_activity(
+    def test_footer_scopes_complete_export_to_ir_coverage(self, ledger_exporter):
+        ledger_exporter.provenance.activities = [
+            {"type": "save_dataset", "ir": create_data_saving_ir().to_dict()}
+        ]
+        path = ledger_exporter.export(name="all_activities_have_ir")
+        notebook = nbformat.read(path, as_version=4)
+        footers = [
+            cell
+            for cell in notebook.cells
+            if cell.cell_type == "markdown" and "## Results Export" in cell.source
+        ]
+
+        assert len(footers) == 1
+        assert (
+            "Notebook export is complete. All selected activities have exportable IR."
+            in footers[0].source
+        )
+        assert "This analysis is now complete." not in footers[0].source
+
+    def test_excluded_activity_types_are_unique_and_keep_first_seen_order(
+        self, ledger_exporter
+    ):
+        ledger_exporter.provenance.activities = [
+            {"type": "second_step", "ir": None},
+            {"type": "first_step", "ir": None},
+            {"type": "second_step", "ir": None},
+            {
+                # A qualifying activity must not hide excluded ones of the same type.
+                "type": "second_step",
+                "ir": create_sample_ir(
+                    "ledger.second_step", "second_step", "Qualifying activity"
+                ).to_dict(),
+            },
+        ]
+        path = ledger_exporter.export(name="repeated_excluded_types")
+        notebook = nbformat.read(path, as_version=4)
+
+        assert notebook.metadata.lobster.ir_statistics == {
+            "n_irs_extracted": 1,
+            "n_activities": 4,
+            "coverage_percent": 25.0,
+        }
+        for marker in ("## Results Export", "## Provenance & Reproducibility"):
+            cells = [
+                cell
+                for cell in notebook.cells
+                if cell.cell_type == "markdown" and marker in cell.source
+            ]
+            assert len(cells) == 1
+            assert cells[0].source.count("`second_step`") == 1
+            assert cells[0].source.count("`first_step`") == 1
+            assert "`second_step`, `first_step`" in cells[0].source
+            if marker == "## Provenance & Reproducibility":
+                assert "| **Provenance-Only Activities** | 3 |" in cells[0].source
+
+    def test_summary_names_excluded_activities_without_attributing_a_cause(
         self, notebook_with_only_save_ir
     ):
-        """W1 will invert this assertion and name the omitted activity."""
-        summary = notebook_with_only_save_ir.cells[-2].source
+        summaries = [
+            cell
+            for cell in notebook_with_only_save_ir.cells
+            if cell.cell_type == "markdown"
+            and "## Provenance & Reproducibility" in cell.source
+        ]
 
-        assert "**1 orchestration activities**" in summary
-        assert "unrecorded_analysis" not in summary
+        assert len(summaries) == 1
+        assert "orchestration activities" not in summaries[0].source
+        assert "unrecorded_analysis" in summaries[0].source

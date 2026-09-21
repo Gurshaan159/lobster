@@ -303,8 +303,8 @@ jobs:
     # Require success rather than checking for "failure": all three jobs above are
     # unconditional, so anything other than success — skipped, cancelled, or an empty
     # result — means this run did not prove what the check claims. Testing for
-    # "failure" exits 0 on every one of those. ci-testing.yml's Test Summary has that
-    # weaker predicate; do not copy it back.
+    # "failure" exits 0 on every one of those. ci-testing.yml's Test Summary carried the
+    # same weak predicate and is repaired in this PR; keep the two in step.
     - name: Check job results
       run: |
         QUALITY_RESULT="${{ needs.quality-and-tests.result }}"
